@@ -382,6 +382,10 @@ class NFlow(object):
     ):
         """NFlow update method"""
         # First, we update internal C structure.
+        if self.udps.rst and packet.syn:
+           return self.expire(
+                udps, sync, n_dissections, statistics, splt, ffi, lib, dissector
+            )
         ret = lib.meter_update_flow(
             self._C,
             packet,

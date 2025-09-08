@@ -17,6 +17,8 @@ from .engine import create_engine, setup_capture, setup_dissector, activate_capt
 from .utils import set_affinity, InternalError, InternalState, NFEvent, NFMode
 from collections import OrderedDict
 from .flow import NFlow
+import threading
+import time
 
 
 ENGINE_LOAD_ERR = "Error when loading engine library. This means that you are probably building nfstream from source \
@@ -29,17 +31,25 @@ NDPI_LOAD_ERR = "Error while loading Dissector. This means that you are building
 
 FLOW_KEY = "{}:{}:{}:{}:{}:{}:{}:{}:{}"
 
+RST_TIMEOUT = 5000000 # microseconds
+
 
 class NFCache(OrderedDict):
-    """LRU Flow Cache
-    The NFCache object is used to cache flows entries such as MRU entries are kept on the end and LRU entries
-    will be at the start. Note that we use OrderedDict which leverages classical python dict combined with a doubly
-    linked list with sentinel nodes to track order.
-    By doing so, we can access in an efficient way idle connections entries that need to expired based on a timeout.
-    """
+    """ Least recently updated dictionary
 
+    A Cache provides fast and efficient way of retrieving data.
+    The NFCache object is used to cache flow records such that least
+    recently accessed flow entries are kept on the top(end) and and least
+    used will be at the bottom. This way, it will be faster and efficient
+    to update flow records.
+
+    """
     def __init__(self, *args, **kwds):
         super().__init__(*args, **kwds)
+        self.activ = True
+        self.meter_scan_tick = 0
+        self.lock = threading.Lock()
+        self.meter_scan_interval = 10000
 
     def __getitem__(self, key):
         return super().__getitem__(key)
@@ -53,7 +63,32 @@ class NFCache(OrderedDict):
 
     def get_lru_key(self):
         return next(iter(self))
+    
+    def stop_threads(self):
+        self.activ = False
 
+def meter_scan_thread(
+    cache,
+    idle_timeout,
+    channel,
+    udps,
+    sync,
+    n_dissections,
+    statistics,
+    splt,
+    ffi,
+    lib,
+    dissector,
+):
+    
+    while cache.activ:
+        with cache.lock:
+            meter_tick = time.time() * 1000000
+            if meter_tick - cache.meter_scan_tick >= cache.meter_scan_interval:
+                meter_scan(meter_tick, cache, idle_timeout, channel, udps, sync, n_dissections, statistics,
+                    splt, ffi, lib, dissector)
+                cache.meter_scan_tick = meter_tick
+        time.sleep(0.5)
 
 def meter_scan(
     meter_tick,
@@ -94,6 +129,22 @@ def meter_scan(
                 remaining = False  # LRU flow is not yet idle.
         except StopIteration:  # Empty cache
             remaining = False
+    
+    for key in list(cache.keys()):
+        flow = cache[key]
+        if flow.udps.rst:
+            if flow.is_idle(meter_tick, RST_TIMEOUT):  # idle, expire it.
+                channel.put(
+                    flow.expire(
+                        udps, sync, n_dissections, statistics, splt, ffi, lib, dissector
+                    )
+                )
+                del cache[key]
+                del flow
+            else:
+                break
+            
+
     return scanned
 
 
@@ -206,6 +257,8 @@ def consume(
             splt,
             dissector,
         )
+
+        cache.move_to_end(flow_key)
         if flow is not None:
             if flow.expiration_id < 0:  # custom expiration
                 channel.put(flow)
@@ -374,15 +427,12 @@ def meter_workflow(
     if lib is None:
         send_error(root_idx, channel, ENGINE_LOAD_ERR)
         return
-    meter_tick, meter_scan_tick, meter_track_tick = (
-        0,
+    meter_tick, meter_track_tick = (
         0,
         0,
     )  # meter, idle scan and perf track timelines
-    meter_scan_interval, meter_track_interval = (
-        10,
-        1000,
-    )  # we scan each 10 msecs and update perf each sec.
+    meter_track_interval = 1000000
+    
     cache = NFCache()
     dissector = setup_dissector(ffi, lib, n_dissections)
     if dissector == ffi.NULL and n_dissections:
@@ -392,6 +442,10 @@ def meter_workflow(
     sync = False
     if len(udps) > 0:  # streamer started with udps: sync internal structures on update.
         sync = True
+
+    t = threading.Thread(target=meter_scan_thread, args=(cache, idle_timeout, channel, udps, sync, n_dissections,
+                                        statistics, splt, ffi, lib, dissector))
+    t.start()
     interface_stats = ffi.new("struct nf_stat *")
     # We ensure that processes start at the same time
     if root_idx == n_roots - 1:
@@ -447,66 +501,25 @@ def meter_workflow(
                     meter_tick = packet_time
                 else:
                     nf_packet.time = meter_tick  # Force time order
-                if ret == 1:  # Must be processed
-                    processed_packets += 1
-                    go_scan = False
-                    if meter_tick - meter_scan_tick >= meter_scan_interval:
-                        go_scan = True  # Activate scan
-                        meter_scan_tick = meter_tick
-                    # Consume packet and return diff
-                    diff = consume(
-                        nf_packet,
-                        cache,
-                        active_timeout,
-                        idle_timeout,
-                        channel,
-                        ffi,
-                        lib,
-                        udps,
-                        sync,
-                        accounting_mode,
-                        n_dissections,
-                        statistics,
-                        splt,
-                        dissector,
-                        decode_tunnels,
-                        system_visibility_mode,
-                    )
-                    active_flows += diff
-                    if go_scan:
-                        idles = meter_scan(
-                            meter_tick,
-                            cache,
-                            idle_timeout,
-                            channel,
-                            udps,
-                            sync,
-                            n_dissections,
-                            statistics,
-                            splt,
-                            ffi,
-                            lib,
-                            dissector,
-                        )
-                        active_flows -= idles
-                else:  # time ticker
-                    if meter_tick - meter_scan_tick >= meter_scan_interval:
-                        idles = meter_scan(
-                            meter_tick,
-                            cache,
-                            idle_timeout,
-                            channel,
-                            udps,
-                            sync,
-                            n_dissections,
-                            statistics,
-                            splt,
-                            ffi,
-                            lib,
-                            dissector,
-                        )
-                        active_flows -= idles
-                        meter_scan_tick = meter_tick
+                with cache.lock:
+                    if ret == 1:  # Must be processed
+                        processed_packets += 1
+                        go_scan = False
+                        if meter_tick - cache.meter_scan_tick >= cache.meter_scan_tick:
+                            go_scan = True  # Activate scan
+                            cache.meter_scan_tick = meter_tick
+                        # Consume packet and return diff
+                        diff = consume(nf_packet, cache, active_timeout, idle_timeout, channel, ffi, lib, udps, sync,
+                                    accounting_mode, n_dissections, statistics, splt, dissector, decode_tunnels,
+                                    system_visibility_mode)
+                        if go_scan:
+                            idles = meter_scan(meter_tick, cache, idle_timeout, channel, udps, sync, n_dissections,
+                                            statistics, splt, ffi, lib, dissector)
+                    else:  # time ticker
+                        if meter_tick - cache.meter_scan_tick >= cache.meter_scan_tick:
+                            idles = meter_scan(meter_tick, cache, idle_timeout, channel, udps, sync, n_dissections,
+                                            statistics, splt, ffi, lib, dissector)
+                            cache.meter_scan_tick = meter_tick
             elif ret == 0:  # Ignored packet
                 ignored_packets += 1
             elif ret == -1:  # Read error or empty buffer
@@ -530,6 +543,8 @@ def meter_workflow(
         lib.capture_close(capture)
 
     # Expire all remaining flows in the cache.
+    cache.stop_threads()
+    t.join()
     meter_cleanup(
         cache, channel, udps, sync, n_dissections, statistics, splt, ffi, lib, dissector
     )

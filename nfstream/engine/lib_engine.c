@@ -13,7 +13,7 @@ If not, see <http://www.gnu.org/licenses/>.
 ------------------------------------------------------------------------------------------------------------------------
 */
 
-#define TICK_RESOLUTION          1000
+#define TICK_RESOLUTION          1000000
 #define	IPVERSION	4
 #ifndef ETH_P_IP
 #define ETH_P_IP               0x0800 	// IPv4
@@ -985,7 +985,7 @@ static uint8_t flow_expiration_handler(struct nf_flow *flow, struct nf_packet *p
 /**
  * flow_init_splt: Flow SPLT structure initializer.
  */
-static uint8_t flow_init_splt(struct nf_flow *flow, uint16_t splt, uint16_t packet_size) {
+static uint8_t flow_init_splt(struct nf_flow *flow, uint16_t splt, uint16_t packet_size, struct nf_packet *packet) {
   flow->splt_direction = (int8_t*)ndpi_malloc(sizeof(int8_t) * splt); // direction on int8 is more than sufficient.
   if (flow->splt_direction == NULL) {
     ndpi_free(flow);
@@ -1007,7 +1007,12 @@ static uint8_t flow_init_splt(struct nf_flow *flow, uint16_t splt, uint16_t pack
   }
   memset(flow->splt_piat_ms, -1, sizeof(int64_t) * splt); // -1 for missing values
   // SPLT values initialization
-  flow->splt_direction[0] = 0; // First packet always src->dst
+  if ((packet->syn && packet->ack) || (packet->rst && packet->ack)) {
+    flow->splt_direction[0] = 1; // First packet always src->dst
+  }
+  else{
+    flow->splt_direction[0] = 0;
+  }
   flow->splt_ps[0] = packet_size;
   flow->splt_piat_ms[0] = 0; // We set first piat to zero.
   return 1;
@@ -1255,7 +1260,7 @@ static uint8_t flow_init_bidirectional(struct ndpi_detection_module_struct *diss
                                        uint16_t splt, uint8_t statistics, uint16_t packet_size, struct nf_flow *flow,
                                        struct nf_packet *packet, uint8_t sync) {
   if (splt) {
-    uint8_t splt_init_success = flow_init_splt(flow, splt, packet_size);
+    uint8_t splt_init_success = flow_init_splt(flow, splt, packet_size, packet);
     if (!splt_init_success) return 0;
   }
 
@@ -1269,48 +1274,88 @@ static uint8_t flow_init_bidirectional(struct ndpi_detection_module_struct *diss
   flow->bidirectional_last_seen_ms = packet->time;
   flow->tunnel_id = packet->tunnel_id;
   flow->ip_version = packet->ip_version;
-  if (flow->ip_version == 4) {
-	inet_ntop(AF_INET, (uint32_t *)&packet->src_ip[0], flow->src_ip_str, sizeof(flow->src_ip_str));
-	inet_ntop(AF_INET, (uint32_t *)&packet->dst_ip[0], flow->dst_ip_str, sizeof(flow->dst_ip_str));
-  } else {
-	inet_ntop(AF_INET6, (struct sockaddr_in6 *)&packet->src_ip[0], flow->src_ip_str, sizeof(flow->src_ip_str));
-	inet_ntop(AF_INET6, (struct sockaddr_in6 *)&packet->dst_ip[0], flow->dst_ip_str, sizeof(flow->dst_ip_str));
+
+  if ((packet->syn && packet->ack) || (packet->rst && packet->ack)) {
+      if (flow->ip_version == 4) {
+      inet_ntop(AF_INET, (uint32_t *)&packet->dst_ip[0], flow->src_ip_str, sizeof(flow->src_ip_str));
+      inet_ntop(AF_INET, (uint32_t *)&packet->src_ip[0], flow->dst_ip_str, sizeof(flow->dst_ip_str));
+      } else {
+      inet_ntop(AF_INET6, (struct sockaddr_in6 *)&packet->dst_ip[0], flow->src_ip_str, sizeof(flow->src_ip_str));
+      inet_ntop(AF_INET6, (struct sockaddr_in6 *)&packet->src_ip[0], flow->dst_ip_str, sizeof(flow->dst_ip_str));
+      }
+      flow->src_ip[0] = packet->dst_ip[0];
+      flow->src_ip[1] = packet->dst_ip[1];
+      flow->src_mac[0] = packet->dst_mac[0];
+      flow->src_mac[1] = packet->dst_mac[1];
+      flow->src_mac[2] = packet->dst_mac[2];
+      flow->src_mac[3] = packet->dst_mac[3];
+      flow->src_mac[4] = packet->dst_mac[4];
+      flow->src_mac[5] = packet->dst_mac[5];
+      ndpi_snprintf(flow->src_mac_str, sizeof(flow->src_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                    packet->dst_mac[0], packet->dst_mac[1], packet->dst_mac[2],
+                    packet->dst_mac[3], packet->dst_mac[4], packet->dst_mac[5]);
+      memcpy(flow->src_oui, flow->src_mac_str, 8);
+      flow->src_port = packet->dst_port;
+      flow->dst_ip[0] = packet->src_ip[0];
+      flow->dst_ip[1] = packet->src_ip[1];
+      flow->dst_mac[0] = packet->src_mac[0];
+      flow->dst_mac[1] = packet->src_mac[1];
+      flow->dst_mac[2] = packet->src_mac[2];
+      flow->dst_mac[3] = packet->src_mac[3];
+      flow->dst_mac[4] = packet->src_mac[4];
+      flow->dst_mac[5] = packet->src_mac[5];
+      ndpi_snprintf(flow->dst_mac_str, sizeof(flow->dst_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                    packet->src_mac[0], packet->src_mac[1], packet->src_mac[2],
+                    packet->src_mac[3], packet->src_mac[4], packet->src_mac[5]);
+      memcpy(flow->dst_oui, flow->dst_mac_str, 8);
+      flow->dst_port = packet->src_port;
+
   }
-  flow->src_ip[0] = packet->src_ip[0];
-  flow->src_ip[1] = packet->src_ip[1];
-  flow->src_mac[0] = packet->src_mac[0];
-  flow->src_mac[1] = packet->src_mac[1];
-  flow->src_mac[2] = packet->src_mac[2];
-  flow->src_mac[3] = packet->src_mac[3];
-  flow->src_mac[4] = packet->src_mac[4];
-  flow->src_mac[5] = packet->src_mac[5];
-  ndpi_snprintf(flow->src_mac_str, sizeof(flow->src_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
-                packet->src_mac[0], packet->src_mac[1], packet->src_mac[2],
-                packet->src_mac[3], packet->src_mac[4], packet->src_mac[5]);
-  memcpy(flow->src_oui, flow->src_mac_str, 8);
-  flow->src_port = packet->src_port;
-  flow->dst_ip[0] = packet->dst_ip[0];
-  flow->dst_ip[1] = packet->dst_ip[1];
-  flow->dst_mac[0] = packet->dst_mac[0];
-  flow->dst_mac[1] = packet->dst_mac[1];
-  flow->dst_mac[2] = packet->dst_mac[2];
-  flow->dst_mac[3] = packet->dst_mac[3];
-  flow->dst_mac[4] = packet->dst_mac[4];
-  flow->dst_mac[5] = packet->dst_mac[5];
-  ndpi_snprintf(flow->dst_mac_str, sizeof(flow->dst_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
-                packet->dst_mac[0], packet->dst_mac[1], packet->dst_mac[2],
-                packet->dst_mac[3], packet->dst_mac[4], packet->dst_mac[5]);
-  memcpy(flow->dst_oui, flow->dst_mac_str, 8);
-  flow->dst_port = packet->dst_port;
-  flow->protocol = packet->protocol;
-  flow->vlan_id = packet->vlan_id;
-  flow->bidirectional_packets = 1;
-  flow->bidirectional_bytes += packet_size;
-  if (statistics == 1) {
-    flow_init_bidirectional_ps(flow, packet_size);
-    flow_update_bidirectional_tcp_flags(flow, packet);
-  }
-  return 1;
+  else{
+
+      if (flow->ip_version == 4) {
+      inet_ntop(AF_INET, (uint32_t *)&packet->src_ip[0], flow->src_ip_str, sizeof(flow->src_ip_str));
+      inet_ntop(AF_INET, (uint32_t *)&packet->dst_ip[0], flow->dst_ip_str, sizeof(flow->dst_ip_str));
+      } else {
+      inet_ntop(AF_INET6, (struct sockaddr_in6 *)&packet->src_ip[0], flow->src_ip_str, sizeof(flow->src_ip_str));
+      inet_ntop(AF_INET6, (struct sockaddr_in6 *)&packet->dst_ip[0], flow->dst_ip_str, sizeof(flow->dst_ip_str));
+      }
+      flow->src_ip[0] = packet->src_ip[0];
+      flow->src_ip[1] = packet->src_ip[1];
+      flow->src_mac[0] = packet->src_mac[0];
+      flow->src_mac[1] = packet->src_mac[1];
+      flow->src_mac[2] = packet->src_mac[2];
+      flow->src_mac[3] = packet->src_mac[3];
+      flow->src_mac[4] = packet->src_mac[4];
+      flow->src_mac[5] = packet->src_mac[5];
+      ndpi_snprintf(flow->src_mac_str, sizeof(flow->src_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                    packet->src_mac[0], packet->src_mac[1], packet->src_mac[2],
+                    packet->src_mac[3], packet->src_mac[4], packet->src_mac[5]);
+      memcpy(flow->src_oui, flow->src_mac_str, 8);
+      flow->src_port = packet->src_port;
+      flow->dst_ip[0] = packet->dst_ip[0];
+      flow->dst_ip[1] = packet->dst_ip[1];
+      flow->dst_mac[0] = packet->dst_mac[0];
+      flow->dst_mac[1] = packet->dst_mac[1];
+      flow->dst_mac[2] = packet->dst_mac[2];
+      flow->dst_mac[3] = packet->dst_mac[3];
+      flow->dst_mac[4] = packet->dst_mac[4];
+      flow->dst_mac[5] = packet->dst_mac[5];
+      ndpi_snprintf(flow->dst_mac_str, sizeof(flow->dst_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                    packet->dst_mac[0], packet->dst_mac[1], packet->dst_mac[2],
+                    packet->dst_mac[3], packet->dst_mac[4], packet->dst_mac[5]);
+      memcpy(flow->dst_oui, flow->dst_mac_str, 8);
+      flow->dst_port = packet->dst_port;
+    }
+    flow->protocol = packet->protocol;
+    flow->vlan_id = packet->vlan_id;
+    flow->bidirectional_packets = 1;
+    flow->bidirectional_bytes += packet_size;
+    if (statistics == 1) {
+      flow_init_bidirectional_ps(flow, packet_size);
+      flow_update_bidirectional_tcp_flags(flow, packet);
+    }
+    return 1;
 }
 
 /**
@@ -1690,6 +1735,7 @@ struct nf_flow *meter_initialize_flow(struct nf_packet *packet, uint8_t accounti
   uint8_t flow_init_bidirectional_success = flow_init_bidirectional(dissector, n_dissections, splt, statistics,
                                                                     packet_size, flow, packet, sync);
   if (!flow_init_bidirectional_success) return NULL;
+  flow_set_packet_direction(flow, packet);
   flow_init_src2dst(statistics, packet_size, flow, packet);
   return flow; // we return a pointer to the created flow in order to be cached by Python side.
 }

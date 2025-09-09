@@ -146,6 +146,7 @@ class NFlow(object):
         "dst2src_duration_ms",
         "dst2src_packets",
         "dst2src_bytes",
+        "act_timeout",
         "bidirectional_min_ps",
         "bidirectional_mean_ps",
         "bidirectional_stddev_ps",
@@ -227,6 +228,7 @@ class NFlow(object):
         dissector,
         decode_tunnels,
         system_visibility_mode,
+        act_timeout=False
     ):
         self.id = (
             NFEvent.FLOW
@@ -265,6 +267,7 @@ class NFlow(object):
         self.dst2src_duration_ms = self._C.dst2src_duration_ms
         self.dst2src_packets = self._C.dst2src_packets
         self.dst2src_bytes = self._C.dst2src_bytes
+        self.act_timeout = act_timeout
         if decode_tunnels:
             self.tunnel_id = self._C.tunnel_id
         if statistics:  # if statistical analysis set, we activate statistical slots.

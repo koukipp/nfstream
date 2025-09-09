@@ -283,6 +283,7 @@ def consume(
                         dissector,
                         decode_tunnels,
                         system_visibility_mode,
+                        True
                     )
                     if (
                         cache[flow_key].expiration_id == -1
